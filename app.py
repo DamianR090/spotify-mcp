@@ -524,9 +524,20 @@ async def spotify_get_playlist_tracks(params: PlaylistTracksInput) -> str:
     """
     try:
         pid = params.playlist_id.split(":")[-1]
-        p = {"additional_types": "track"}
-        if params.market:
-            p["market"] = params.market
+        # A missing market + additional_types=track is a known trigger for 403s
+        # on /playlists/{id}/tracks even when scopes are fine. Default the market
+        # to the account's country and request explicit fields.
+        market = params.market
+        if not market:
+            try:
+                market = (await _api("GET", "/me")).get("country")
+            except Exception:
+                market = None
+        p = {"limit": 50,
+             "fields": "items(added_at,track(name,id,uri,duration_ms,popularity,"
+                       "artists(name),album(name))),next"}
+        if market:
+            p["market"] = market
         rows = await _paginate(f"/playlists/{pid}/tracks", params=p, item_limit=params.limit)
         items = []
         for r in rows:
