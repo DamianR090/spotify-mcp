@@ -25,6 +25,8 @@ Endpoints exposed by this process:
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -869,7 +871,204 @@ async def spotify_find_similar(params: FindSimilarInput) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# OAuth bootstrap + health routes (added to the Starlette app below)
+# OAuth 2.0 layer for the Claude connector
+#
+# Claude's custom-connector flow speaks MCP's OAuth profile: it discovers
+# metadata, dynamically registers a client, runs an authorization-code + PKCE
+# flow, and then calls /mcp with a Bearer token. This server is single-user, so
+# the authorization step auto-approves (the security boundary is your private
+# server URL). Tokens are stateless HMAC-signed blobs keyed off CLIENT_SECRET,
+# so they survive free-tier restarts without server-side storage.
+# --------------------------------------------------------------------------- #
+
+_SIGNING_KEY = hashlib.sha256(("mcp-oauth-v1:" + (CLIENT_SECRET or "dev")).encode()).digest()
+
+
+def _b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _b64u_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _sign(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    p = _b64u(raw)
+    sig = _b64u(hmac.new(_SIGNING_KEY, p.encode(), hashlib.sha256).digest())
+    return f"{p}.{sig}"
+
+
+def _unsign(token: str) -> Optional[dict]:
+    try:
+        p, sig = token.split(".", 1)
+        expected = _b64u(hmac.new(_SIGNING_KEY, p.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(expected, sig):
+            return None
+        payload = json.loads(_b64u_decode(p))
+        if payload.get("exp", 0) < time.time():
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _verify_access(token: str) -> bool:
+    p = _unsign(token)
+    return bool(p and p.get("typ") == "access")
+
+
+def _issue_tokens() -> dict:
+    now = int(time.time())
+    return {
+        "access_token": _sign({"typ": "access", "exp": now + 3600}),
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token": _sign({"typ": "refresh", "exp": now + 30 * 86400}),
+        "scope": "mcp",
+    }
+
+
+def _base_url(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto", "https")
+    host = request.headers.get("host", "")
+    return f"{proto}://{host}"
+
+
+async def _read_params(request: Request) -> dict:
+    ctype = request.headers.get("content-type", "")
+    if "application/json" in ctype:
+        try:
+            return await request.json()
+        except Exception:
+            return {}
+    raw = (await request.body()).decode()
+    return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+
+
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    base = _base_url(request)
+    return JSONResponse({
+        "resource": f"{base}/mcp",
+        "authorization_servers": [base],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"],
+    })
+
+
+async def oauth_authorization_server(request: Request) -> JSONResponse:
+    base = _base_url(request)
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/oauth/authorize",
+        "token_endpoint": f"{base}/oauth/token",
+        "registration_endpoint": f"{base}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": ["mcp"],
+    })
+
+
+async def oauth_register(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    resp = {
+        "client_id": "mcp-" + secrets.token_urlsafe(16),
+        "client_id_issued_at": int(time.time()),
+        "redirect_uris": body.get("redirect_uris", []),
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    }
+    for k in ("client_name", "scope"):
+        if k in body:
+            resp[k] = body[k]
+    return JSONResponse(resp, status_code=201)
+
+
+async def oauth_authorize(request: Request) -> JSONResponse | RedirectResponse:
+    q = request.query_params
+    redirect_uri = q.get("redirect_uri")
+    code_challenge = q.get("code_challenge")
+    if not redirect_uri or not code_challenge or q.get("code_challenge_method") != "S256":
+        return JSONResponse(
+            {"error": "invalid_request",
+             "error_description": "redirect_uri and S256 PKCE are required"},
+            status_code=400,
+        )
+    code = _sign({"typ": "code", "cc": code_challenge, "ru": redirect_uri,
+                  "exp": int(time.time()) + 300})
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}code={urllib.parse.quote(code)}"
+    state = q.get("state")
+    if state:
+        location += f"&state={urllib.parse.quote(state)}"
+    return RedirectResponse(location, status_code=302)
+
+
+async def oauth_token(request: Request) -> JSONResponse:
+    params = await _read_params(request)
+    grant = params.get("grant_type")
+    if grant == "authorization_code":
+        payload = _unsign(params.get("code", ""))
+        if not payload or payload.get("typ") != "code":
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        if payload.get("ru") != params.get("redirect_uri"):
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "redirect_uri mismatch"}, status_code=400)
+        check = _b64u(hashlib.sha256(params.get("code_verifier", "").encode()).digest())
+        if not hmac.compare_digest(check, payload.get("cc", "")):
+            return JSONResponse({"error": "invalid_grant",
+                                 "error_description": "PKCE verification failed"}, status_code=400)
+        return JSONResponse(_issue_tokens())
+    if grant == "refresh_token":
+        payload = _unsign(params.get("refresh_token", ""))
+        if not payload or payload.get("typ") != "refresh":
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+        return JSONResponse(_issue_tokens())
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+
+class MCPAuthMiddleware:
+    """Pure-ASGI gate on /mcp. Passes authorized requests through untouched
+    (so MCP's streaming responses are not buffered); returns a 401 with a
+    WWW-Authenticate pointer otherwise, which kicks off Claude's OAuth flow.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = scope.get("path", "")
+            if path == "/mcp" or path.startswith("/mcp/"):
+                headers = dict(scope.get("headers") or [])
+                auth = headers.get(b"authorization", b"").decode()
+                token = auth[7:] if auth[:7].lower() == "bearer " else ""
+                if not _verify_access(token):
+                    proto = headers.get(b"x-forwarded-proto", b"https").decode()
+                    host = headers.get(b"host", b"").decode()
+                    meta = f"{proto}://{host}/.well-known/oauth-protected-resource"
+                    await send({
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"www-authenticate", f'Bearer resource_metadata="{meta}"'.encode()),
+                        ],
+                    })
+                    await send({"type": "http.response.body",
+                                "body": b'{"error":"invalid_token"}'})
+                    return
+        await self.app(scope, receive, send)
+
+
+# --------------------------------------------------------------------------- #
+# Spotify OAuth bootstrap + health routes
 # --------------------------------------------------------------------------- #
 
 async def health(_request: Request) -> JSONResponse:
@@ -881,6 +1080,7 @@ async def health(_request: Request) -> JSONResponse:
         "client_configured": bool(CLIENT_ID and CLIENT_SECRET),
         "redirect_uri_set": bool(REDIRECT_URI),
         "lastfm_enabled": bool(LASTFM_API_KEY),
+        "connector_oauth": "enabled",
         "mcp_endpoint": "/mcp",
     })
 
@@ -935,14 +1135,31 @@ async def callback(request: Request) -> HTMLResponse:
 
 
 # --------------------------------------------------------------------------- #
-# Build the ASGI app: MCP at /mcp + helper routes
+# Build the ASGI app: MCP at /mcp (OAuth-gated) + OAuth + helper routes
 # --------------------------------------------------------------------------- #
 
-app = mcp.streamable_http_app()  # Starlette app; mounts the MCP endpoint at /mcp
-app.add_route("/health", health, methods=["GET"])
-app.add_route("/", health, methods=["GET"])
-app.add_route("/login", login, methods=["GET"])
-app.add_route("/callback", callback, methods=["GET"])
+_starlette = mcp.streamable_http_app()  # Starlette app; mounts the MCP endpoint at /mcp
+
+# OAuth discovery metadata (served at root and path-suffixed variants clients probe)
+for _p in ("/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"):
+    _starlette.add_route(_p, oauth_protected_resource, methods=["GET"])
+for _p in ("/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/mcp",
+           "/.well-known/openid-configuration"):
+    _starlette.add_route(_p, oauth_authorization_server, methods=["GET"])
+
+# OAuth endpoints
+_starlette.add_route("/oauth/register", oauth_register, methods=["POST"])
+_starlette.add_route("/oauth/authorize", oauth_authorize, methods=["GET"])
+_starlette.add_route("/oauth/token", oauth_token, methods=["POST"])
+
+# Health + Spotify bootstrap
+_starlette.add_route("/health", health, methods=["GET"])
+_starlette.add_route("/", health, methods=["GET"])
+_starlette.add_route("/login", login, methods=["GET"])
+_starlette.add_route("/callback", callback, methods=["GET"])
+
+# Gate /mcp behind the connector OAuth token (everything else stays open).
+app = MCPAuthMiddleware(_starlette)
 
 
 if __name__ == "__main__":
