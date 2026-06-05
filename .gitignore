@@ -1,0 +1,22 @@
+# Secrets — never commit the real env file (the .example template is fine)
+.env
+.env.local
+*.token
+.spotify_token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
