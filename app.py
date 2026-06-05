@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -277,7 +278,14 @@ def _to_uris(ids_or_uris: List[str]) -> List[str]:
 # MCP server
 # --------------------------------------------------------------------------- #
 
-mcp = FastMCP("spotify_mcp", stateless_http=True)
+mcp = FastMCP(
+    "spotify_mcp",
+    stateless_http=True,
+    # The MCP layer's DNS-rebinding guard otherwise 421s requests whose Host
+    # isn't on a localhost allowlist (e.g. the Render domain). Our security
+    # boundary is the OAuth token + private URL, so disable the host check.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 RO = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
 WRITE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True}
