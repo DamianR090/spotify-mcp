@@ -888,6 +888,40 @@ async def spotify_find_similar(params: FindSimilarInput) -> str:
         return _err(e)
 
 
+async def debug_playlist(request: Request) -> JSONResponse:
+    """TEMPORARY diagnostic: hits Spotify directly for a playlist's tracks and
+    returns the raw status + body. Visit /debug/playlist/<id>. Remove later.
+    """
+    pid = request.path_params["pid"]
+    out: Dict[str, Any] = {"playlist_id": pid}
+    try:
+        token = await _ensure_token()
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            # who am I + product/country
+            me = await client.get(f"{SPOTIFY_API_BASE}/me",
+                                  headers={"Authorization": f"Bearer {token}"})
+            out["me_status"] = me.status_code
+            mj = me.json() if me.status_code == 200 else {}
+            out["me"] = {"id": mj.get("id"), "country": mj.get("country"),
+                         "product": mj.get("product")}
+            # the playlist metadata (this worked before)
+            meta = await client.get(f"{SPOTIFY_API_BASE}/playlists/{pid}",
+                                    headers={"Authorization": f"Bearer {token}"},
+                                    params={"fields": "id,name,owner(id,display_name),public,collaborative"})
+            out["meta_status"] = meta.status_code
+            out["meta"] = meta.json() if meta.status_code == 200 else meta.text[:300]
+            # the failing tracks call — plain, no extra params
+            tr = await client.get(f"{SPOTIFY_API_BASE}/playlists/{pid}/tracks",
+                                  headers={"Authorization": f"Bearer {token}"},
+                                  params={"limit": 5})
+            out["tracks_status"] = tr.status_code
+            out["tracks_body"] = tr.text[:600]
+            out["tracks_scopes_header"] = tr.headers.get("WWW-Authenticate", "")
+    except Exception as e:
+        out["exception"] = f"{type(e).__name__}: {e}"
+    return JSONResponse(out)
+
+
 # --------------------------------------------------------------------------- #
 # OAuth 2.0 layer for the Claude connector
 #
@@ -1175,6 +1209,7 @@ _starlette.add_route("/health", health, methods=["GET"])
 _starlette.add_route("/", health, methods=["GET"])
 _starlette.add_route("/login", login, methods=["GET"])
 _starlette.add_route("/callback", callback, methods=["GET"])
+_starlette.add_route("/debug/playlist/{pid}", debug_playlist, methods=["GET"])  # TEMP diagnostic
 
 # Gate /mcp behind the connector OAuth token (everything else stays open).
 app = MCPAuthMiddleware(_starlette)
