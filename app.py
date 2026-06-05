@@ -527,9 +527,9 @@ async def spotify_get_playlist_tracks(params: PlaylistTracksInput) -> str:
     """
     try:
         pid = params.playlist_id.split(":")[-1]
-        fields = ("name,tracks(total,next,items(added_at,track(name,id,uri,"
-                  "duration_ms,popularity,artists(name),album(name)))))")
-        data = await _api("GET", f"/playlists/{pid}", params={"fields": fields})
+        # No `fields` filter — a malformed fields string makes Spotify 500, and
+        # the full metadata response reliably embeds the first 100 tracks.
+        data = await _api("GET", f"/playlists/{pid}")
         block = data.get("tracks", {}) or {}
         rows = list(block.get("items", []))
         total = block.get("total", len(rows))
@@ -541,7 +541,7 @@ async def spotify_get_playlist_tracks(params: PlaylistTracksInput) -> str:
             try:
                 page = await _api("GET", next_url)
             except SpotifyError:
-                note = (f"Spotify allowed only the first {len(rows)} of {total} tracks "
+                note = (f"Spotify returned only the first {len(rows)} of {total} tracks "
                         f"(its dev-mode restriction blocks deeper paging).")
                 break
             rows.extend(page.get("items", []))
