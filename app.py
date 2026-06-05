@@ -165,9 +165,8 @@ async def _api(method: str, path: str, *, params: Optional[dict] = None,
         raise SpotifyError(f"Rate limited by Spotify. Retry after {retry_after} seconds.")
     if resp.status_code == 403:
         raise SpotifyError(
-            "Spotify returned 403 Forbidden. Either the action needs a scope you "
-            "didn't grant (re-run /login), or it hits an endpoint deprecated for "
-            "new apps (Recommendations / Related Artists / Audio Features are gone)."
+            f"Spotify returned 403 Forbidden. Spotify's actual response: {resp.text[:400]} "
+            f"| Request was: {method} {url} params={params}"
         )
     if resp.status_code == 404:
         raise SpotifyError("Not found (404). Double-check the id/URI you passed.")
