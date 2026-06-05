@@ -889,34 +889,57 @@ async def spotify_find_similar(params: FindSimilarInput) -> str:
 
 
 async def debug_playlist(request: Request) -> JSONResponse:
-    """TEMPORARY diagnostic: hits Spotify directly for a playlist's tracks and
-    returns the raw status + body. Visit /debug/playlist/<id>. Remove later.
+    """TEMPORARY diagnostic: probes several Spotify read endpoints and returns
+    raw statuses to isolate whether the 403 is app-wide or playlist-specific.
+    Visit /debug/playlist/<id>. Remove later.
     """
     pid = request.path_params["pid"]
     out: Dict[str, Any] = {"playlist_id": pid}
     try:
         token = await _ensure_token()
+        hdr = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            # who am I + product/country
-            me = await client.get(f"{SPOTIFY_API_BASE}/me",
-                                  headers={"Authorization": f"Bearer {token}"})
-            out["me_status"] = me.status_code
+            me = await client.get(f"{SPOTIFY_API_BASE}/me", headers=hdr)
             mj = me.json() if me.status_code == 200 else {}
             out["me"] = {"id": mj.get("id"), "country": mj.get("country"),
                          "product": mj.get("product")}
-            # the playlist metadata (this worked before)
-            meta = await client.get(f"{SPOTIFY_API_BASE}/playlists/{pid}",
-                                    headers={"Authorization": f"Bearer {token}"},
-                                    params={"fields": "id,name,owner(id,display_name),public,collaborative"})
-            out["meta_status"] = meta.status_code
-            out["meta"] = meta.json() if meta.status_code == 200 else meta.text[:300]
-            # the failing tracks call — plain, no extra params
+
+            # 1) target playlist metadata (known-good)
+            meta = await client.get(f"{SPOTIFY_API_BASE}/playlists/{pid}", headers=hdr,
+                                    params={"fields": "id,name,owner(id)"})
+            out["1_target_meta_status"] = meta.status_code
+
+            # 2) target playlist TRACKS (the failing call)
             tr = await client.get(f"{SPOTIFY_API_BASE}/playlists/{pid}/tracks",
-                                  headers={"Authorization": f"Bearer {token}"},
-                                  params={"limit": 5})
-            out["tracks_status"] = tr.status_code
-            out["tracks_body"] = tr.text[:600]
-            out["tracks_scopes_header"] = tr.headers.get("WWW-Authenticate", "")
+                                  headers=hdr, params={"limit": 3})
+            out["2_target_tracks_status"] = tr.status_code
+
+            # 3) Liked Songs (different endpoint, needs user-library-read)
+            lk = await client.get(f"{SPOTIFY_API_BASE}/me/tracks", headers=hdr,
+                                  params={"limit": 3})
+            out["3_liked_songs_status"] = lk.status_code
+
+            # 4) Top tracks (needs user-top-read)
+            tp = await client.get(f"{SPOTIFY_API_BASE}/me/top/tracks", headers=hdr,
+                                  params={"limit": 3})
+            out["4_top_tracks_status"] = tp.status_code
+
+            # 5) tracks of the FIRST playlist returned by /me/playlists
+            pls = await client.get(f"{SPOTIFY_API_BASE}/me/playlists", headers=hdr,
+                                   params={"limit": 5})
+            out["5_list_playlists_status"] = pls.status_code
+            if pls.status_code == 200:
+                items = pls.json().get("items", [])
+                probed = []
+                for p in items[:3]:
+                    if not p:
+                        continue
+                    r = await client.get(f"{SPOTIFY_API_BASE}/playlists/{p['id']}/tracks",
+                                         headers=hdr, params={"limit": 1})
+                    probed.append({"name": p.get("name"),
+                                   "owner": (p.get("owner") or {}).get("id"),
+                                   "tracks_status": r.status_code})
+                out["6_other_playlists_tracks"] = probed
     except Exception as e:
         out["exception"] = f"{type(e).__name__}: {e}"
     return JSONResponse(out)
