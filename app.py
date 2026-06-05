@@ -518,34 +518,46 @@ class PlaylistTracksInput(BaseModel):
 async def spotify_get_playlist_tracks(params: PlaylistTracksInput) -> str:
     """Enumerate the actual tracks inside a playlist, in order.
 
-    This is the capability the default Spotify connector lacks. Returns
-    {count, items:[{name, artists, album, id, uri, added_at}]}.
+    Spotify blocks the dedicated /playlists/{id}/tracks endpoint for apps in
+    Development Mode (bare 403), but the /playlists/{id} metadata endpoint stays
+    readable and embeds the first 100 tracks. We read through that. For playlists
+    over 100 tracks we try to page the rest, and if Spotify blocks paging we
+    return the first 100 with a note rather than failing.
+    Returns {count, total, items:[{name, artists, album, id, uri, added_at}], note?}.
     """
     try:
         pid = params.playlist_id.split(":")[-1]
-        # A missing market + additional_types=track is a known trigger for 403s
-        # on /playlists/{id}/tracks even when scopes are fine. Default the market
-        # to the account's country and request explicit fields.
-        market = params.market
-        if not market:
+        fields = ("name,tracks(total,next,items(added_at,track(name,id,uri,"
+                  "duration_ms,popularity,artists(name),album(name)))))")
+        data = await _api("GET", f"/playlists/{pid}", params={"fields": fields})
+        block = data.get("tracks", {}) or {}
+        rows = list(block.get("items", []))
+        total = block.get("total", len(rows))
+        note = None
+
+        # Try to page beyond the embedded first 100 (may be blocked in dev mode).
+        next_url = block.get("next")
+        while next_url and len(rows) < params.limit:
             try:
-                market = (await _api("GET", "/me")).get("country")
-            except Exception:
-                market = None
-        p = {"limit": 50,
-             "fields": "items(added_at,track(name,id,uri,duration_ms,popularity,"
-                       "artists(name),album(name))),next"}
-        if market:
-            p["market"] = market
-        rows = await _paginate(f"/playlists/{pid}/tracks", params=p, item_limit=params.limit)
+                page = await _api("GET", next_url)
+            except SpotifyError:
+                note = (f"Spotify allowed only the first {len(rows)} of {total} tracks "
+                        f"(its dev-mode restriction blocks deeper paging).")
+                break
+            rows.extend(page.get("items", []))
+            next_url = page.get("next")
+
         items = []
-        for r in rows:
+        for r in rows[:params.limit]:
             t = _fmt_track(r.get("track", {}))
             if not t:
                 continue
             t["added_at"] = r.get("added_at")
             items.append(t)
-        return _ok({"count": len(items), "items": items})
+        result = {"count": len(items), "total": total, "items": items}
+        if note:
+            result["note"] = note
+        return _ok(result)
     except Exception as e:
         return _err(e)
 
